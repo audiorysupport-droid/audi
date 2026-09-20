@@ -2543,6 +2543,432 @@ async function getRoyaltyPayoutItems(
   }));
 }
 
+async function getCanonicalRoyaltyRecipientName(
+  env,
+  userId,
+  recipientType,
+  recipientId,
+  fallbackName = null
+) {
+  const ledgerRecipient = await env.DB.prepare(`
+    SELECT recipient_name
+    FROM royalty_ledger
+    WHERE user_id = ?
+      AND recipient_type = ?
+      AND recipient_id = ?
+      AND recipient_name IS NOT NULL
+      AND TRIM(recipient_name) != ''
+    ORDER BY created_at DESC
+    LIMIT 1
+  `)
+    .bind(
+      userId,
+      recipientType,
+      recipientId
+    )
+    .first();
+
+  if (ledgerRecipient?.recipient_name) {
+    return ledgerRecipient.recipient_name;
+  }
+
+  if (recipientType === "artist") {
+    const artist = await env.DB.prepare(`
+      SELECT name
+      FROM artists
+      WHERE id = ?
+        AND user_id = ?
+      LIMIT 1
+    `)
+      .bind(recipientId, userId)
+      .first();
+
+    return artist?.name || fallbackName || "Unknown recipient";
+  }
+
+  if (recipientType === "contributor") {
+    const contributor = await env.DB.prepare(`
+      SELECT name
+      FROM track_contributors
+      WHERE id = ?
+        AND user_id = ?
+      LIMIT 1
+    `)
+      .bind(recipientId, userId)
+      .first();
+
+    return contributor?.name || fallbackName || "Unknown recipient";
+  }
+
+  return fallbackName || "Unknown recipient";
+}
+
+function parseCsvLine(line) {
+  const values = [];
+  let value = "";
+  let insideQuotes = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const char = line[i];
+
+    if (char === '"') {
+      if (insideQuotes && line[i + 1] === '"') {
+        value += '"';
+        i++;
+      } else {
+        insideQuotes = !insideQuotes;
+      }
+
+      continue;
+    }
+
+    if (char === "," && !insideQuotes) {
+      values.push(value);
+      value = "";
+      continue;
+    }
+
+    value += char;
+  }
+
+  values.push(value);
+
+  return values;
+}
+
+function parseCSV(text) {
+  // Remove UTF-8 BOM if present
+  text = String(text || "").replace(/^\uFEFF/, "");
+
+  const lines = text
+    .split(/\r?\n/)
+    .filter(line => line.trim() !== "");
+
+  if (!lines.length) {
+    return {
+      headers: [],
+      rows: []
+    };
+  }
+
+  const headers = parseCsvLine(lines[0]).map(header =>
+    header.trim().toLowerCase()
+  );
+
+  const rows = [];
+
+  for (let i = 1; i < lines.length; i++) {
+    const values = parseCsvLine(lines[i]);
+
+    const row = {};
+
+    headers.forEach((header, index) => {
+      row[header] =
+        values[index] !== undefined
+          ? values[index]
+          : "";
+    });
+
+    rows.push(row);
+  }
+
+  return {
+    headers,
+    rows
+  };
+}
+
+function getMappedValue(row, mapping, field) {
+  const column = mapping?.[field];
+
+  if (!column) {
+    return null;
+  }
+
+  return row[column] !== undefined
+    ? row[column]
+    : null;
+}
+
+function normalizeMappedCSVRow(row, mapping, rowNumber) {
+  const mapped = {
+    isrc: getMappedValue(row, mapping, "isrc"),
+    event_date: getMappedValue(row, mapping, "event_date"),
+    channel: getMappedValue(row, mapping, "channel"),
+    territory: getMappedValue(row, mapping, "territory"),
+    streams: getMappedValue(row, mapping, "streams"),
+    downloads: getMappedValue(row, mapping, "downloads"),
+    units: getMappedValue(row, mapping, "units"),
+    gross_revenue: getMappedValue(
+      row,
+      mapping,
+      "gross_revenue"
+    ),
+    net_revenue: getMappedValue(
+      row,
+      mapping,
+      "net_revenue"
+    ),
+    currency: getMappedValue(
+      row,
+      mapping,
+      "currency"
+    ),
+    stream_rate: getMappedValue(
+      row,
+      mapping,
+      "stream_rate"
+    ),
+    source_record_id: getMappedValue(
+      row,
+      mapping,
+      "source_record_id"
+    ),
+    sale_type: getMappedValue(
+      row,
+      mapping,
+      "sale_type"
+    )
+  };
+
+  return normalizeImportedSalesRow(
+    mapped,
+    rowNumber
+  );
+}
+
+
+function parseCsvText(csvText) {
+  const text = String(csvText || "")
+    .replace(/^\uFEFF/, "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n");
+
+  const lines = [];
+  let current = "";
+  let insideQuotes = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+
+    if (char === '"') {
+      if (insideQuotes && text[i + 1] === '"') {
+        current += '""';
+        i++;
+        continue;
+      }
+
+      insideQuotes = !insideQuotes;
+      current += char;
+      continue;
+    }
+
+    if (char === "\n" && !insideQuotes) {
+      lines.push(current);
+      current = "";
+      continue;
+    }
+
+    current += char;
+  }
+
+  if (current.length > 0) {
+    lines.push(current);
+  }
+
+  if (!lines.length) {
+    return {
+      headers: [],
+      rows: []
+    };
+  }
+
+  const headers = parseCsvLine(lines[0]).map(header =>
+    String(header || "")
+      .trim()
+      .replace(/^"|"$/g, "")
+  );
+
+  const rows = [];
+
+  for (let i = 1; i < lines.length; i++) {
+    if (!lines[i].trim()) {
+      continue;
+    }
+
+    const values = parseCsvLine(lines[i]);
+
+    const row = {};
+
+    headers.forEach((header, index) => {
+      row[header] = String(values[index] || "")
+        .trim()
+        .replace(/^"|"$/g, "");
+    });
+
+    rows.push(row);
+  }
+
+  return {
+    headers,
+    rows
+  };
+}
+
+function normalizeCsvColumnName(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s\-]+/g, "_");
+}
+
+
+const CSV_COLUMN_ALIASES = {
+  isrc: [
+    "isrc",
+    "track_isrc",
+    "isrc_code",
+    "recording_isrc"
+  ],
+
+  event_date: [
+    "event_date",
+    "date",
+    "report_date",
+    "sale_date",
+    "stream_date"
+  ],
+
+  channel: [
+    "channel",
+    "platform",
+    "service",
+    "store"
+  ],
+
+  territory: [
+    "territory",
+    "country",
+    "country_code",
+    "market"
+  ],
+
+  streams: [
+    "streams",
+    "stream",
+    "stream_count"
+  ],
+
+  downloads: [
+    "downloads",
+    "download",
+    "download_count"
+  ],
+
+  units: [
+    "units",
+    "unit_count"
+  ],
+
+  gross_revenue: [
+    "gross_revenue",
+    "gross",
+    "gross_amount",
+    "gross_royalty"
+  ],
+
+  net_revenue: [
+    "net_revenue",
+    "net",
+    "net_amount",
+    "net_royalty"
+  ],
+
+  currency: [
+    "currency",
+    "currency_code"
+  ],
+
+  source_record_id: [
+    "source_record_id",
+    "record_id",
+    "report_line_id",
+    "line_id",
+    "id"
+  ],
+
+  sale_type: [
+    "sale_type",
+    "type",
+    "transaction_type"
+  ]
+};
+
+
+function suggestCsvColumnMapping(headers) {
+  const normalizedHeaders = headers.map(header => ({
+    original: header,
+    normalized: normalizeCsvColumnName(header)
+  }));
+
+  const mapping = {};
+
+  for (const [field, aliases] of Object.entries(
+    CSV_COLUMN_ALIASES
+  )) {
+    const match = normalizedHeaders.find(header =>
+      aliases.includes(header.normalized)
+    );
+
+    if (match) {
+      mapping[field] = match.original;
+    }
+  }
+
+  return mapping;
+}
+
+async function matchSalesRowByISRC(
+  env,
+  userId,
+  isrc
+) {
+  const normalizedIsrc = String(isrc || "")
+    .trim()
+    .toUpperCase()
+    .replace(/-/g, "");
+
+  if (!normalizedIsrc) {
+    return null;
+  }
+
+  const result = await env.DB.prepare(`
+    SELECT
+      t.id AS track_id,
+      t.release_id,
+      t.isrc,
+      t.title AS track_title,
+      r.title AS release_title,
+      r.artist_id,
+      a.name AS artist_name
+    FROM tracks t
+    INNER JOIN releases r
+      ON r.id = t.release_id
+    LEFT JOIN artists a
+      ON a.id = r.artist_id
+    WHERE t.isrc = ?
+      AND r.user_id = ?
+    LIMIT 1
+  `)
+    .bind(
+      normalizedIsrc,
+      userId
+    )
+    .first();
+
+  return result || null;
+}
+
 
 // -------------------------
 // Main Worker
@@ -16420,7 +16846,7 @@ if (
     env
   );
 
-  if (!authResult.success) {
+  if (!authResult.ok) {
     return authResult.response;
   }
 
@@ -16918,7 +17344,7 @@ if (
       env
     );
 
-  if (!authResult.success) {
+  if (!authResult.ok) {
     return authResult.response;
   }
 
@@ -17012,7 +17438,7 @@ if (
       env
     );
 
-  if (!authResult.success) {
+  if (!authResult.ok) {
     return authResult.response;
   }
 
@@ -19929,6 +20355,17 @@ if (
       }, 404);
     }
 
+    const canonicalRecipientName =
+      await getCanonicalRoyaltyRecipientName(
+        env,
+        userId,
+        recipientType,
+        recipientId,
+        recipient.name
+      );
+
+    recipient.name = canonicalRecipientName;
+
     // --------------------------------------------------------
     // Check for existing statement
     // --------------------------------------------------------
@@ -22064,6 +22501,1153 @@ if (
       error:
         error?.message ||
         "Failed to process royalty payout"
+    }, 500);
+  }
+}
+
+// ============================================================
+// POST /v1/sales/imports/upload
+// Upload CSV to R2
+// ============================================================
+
+if (
+  request.method === "POST" &&
+  url.pathname === "/v1/sales/imports/upload"
+) {
+  const authResult =
+    await requireSalesAuth(
+      request,
+      env
+    );
+
+  if (!authResult.ok) {
+    return authResult.response;
+  }
+
+  const userId =
+    authResult.userId;
+
+  try {
+    const formData =
+      await request.formData();
+
+    const file =
+      formData.get("file");
+
+    const source =
+      normalizeImportSource(
+        formData.get("source")
+      );
+
+    const sourceReportId =
+      String(
+        formData.get("source_report_id") ||
+        ""
+      ).trim();
+
+    if (!file || typeof file === "string") {
+      return json({
+        success: false,
+        error: "CSV file is required"
+      }, 400);
+    }
+
+    if (!source) {
+      return json({
+        success: false,
+        error: "source is required"
+      }, 400);
+    }
+
+    if (!sourceReportId) {
+      return json({
+        success: false,
+        error: "source_report_id is required"
+      }, 400);
+    }
+
+    const fileName =
+      String(
+        file.name ||
+        "sales-report.csv"
+      );
+
+    if (
+      !fileName
+        .toLowerCase()
+        .endsWith(".csv")
+    ) {
+      return json({
+        success: false,
+        error: "Only CSV files are supported"
+      }, 400);
+    }
+
+    const MAX_CSV_SIZE =
+      25 * 1024 * 1024;
+
+    if (file.size > MAX_CSV_SIZE) {
+      return json({
+        success: false,
+        error:
+          "CSV file cannot exceed 25 MB"
+      }, 400);
+    }
+
+    const existingImport =
+      await env.DB.prepare(`
+        SELECT *
+        FROM sales_imports
+        WHERE user_id = ?
+          AND source = ?
+          AND source_report_id = ?
+        LIMIT 1
+      `)
+        .bind(
+          userId,
+          source,
+          sourceReportId
+        )
+        .first();
+
+    if (existingImport) {
+      return json({
+        success: true,
+        duplicate: true,
+        message:
+          "This distributor report has already been uploaded",
+        import: existingImport
+      });
+    }
+
+    const importId =
+      generateSalesImportId();
+
+    const r2Key =
+      `sales-imports/${userId}/${importId}/${fileName}`;
+
+    const arrayBuffer =
+      await file.arrayBuffer();
+
+    await env.MEDIA.put(
+      r2Key,
+      arrayBuffer,
+      {
+        httpMetadata: {
+          contentType:
+            "text/csv"
+        },
+
+        customMetadata: {
+          user_id: userId,
+          import_id: importId,
+          source,
+          source_report_id:
+            sourceReportId
+        }
+      }
+    );
+
+    await env.DB.prepare(`
+      INSERT INTO sales_imports (
+        id,
+        user_id,
+        source,
+        source_report_id,
+        status,
+        records_received,
+        records_imported,
+        records_skipped,
+        total_gross_revenue,
+        total_net_revenue,
+        source_file_key,
+        source_file_name,
+        source_file_size,
+        source_file_content_type,
+        started_at
+      )
+      VALUES (
+        ?, ?, ?, ?, 'uploaded',
+        0, 0, 0, 0, 0,
+        ?, ?, ?, ?,
+        NULL
+      )
+    `)
+      .bind(
+        importId,
+        userId,
+        source,
+        sourceReportId,
+        r2Key,
+        fileName,
+        file.size,
+        "text/csv"
+      )
+      .run();
+
+    return json({
+      success: true,
+      message:
+        "CSV uploaded successfully",
+      import: {
+        id: importId,
+        source,
+        source_report_id:
+          sourceReportId,
+        status: "uploaded",
+        file_name: fileName,
+        file_size: file.size,
+        r2_key: r2Key
+      }
+    }, 201);
+
+  } catch (error) {
+    console.error(
+      "CSV upload error:",
+      error
+    );
+
+    return json({
+      success: false,
+      error:
+        "Failed to upload CSV",
+      details:
+        error?.message ||
+        String(error)
+    }, 500);
+  }
+}
+
+// ============================================================
+// POST /v1/sales/imports/:id/mapping
+// Save CSV column mapping
+// ============================================================
+
+if (
+  request.method === "POST" &&
+  url.pathname.match(
+    /^\/v1\/sales\/imports\/[^/]+\/mapping$/
+  )
+) {
+  const authResult =
+    await requireSalesAuth(
+      request,
+      env
+    );
+
+  // IMPORTANT:
+  // requireSalesAuth() returns .ok, not .success
+  if (!authResult.ok) {
+    return authResult.response;
+  }
+
+  const userId =
+    authResult.userId;
+
+  try {
+    const parts =
+      url.pathname.split("/");
+
+    const importId =
+      parts[4];
+
+    if (!importId) {
+      return json({
+        success: false,
+        error: "Import ID is required"
+      }, 400);
+    }
+
+    // --------------------------------------------------------
+    // Get import
+    // --------------------------------------------------------
+
+    const salesImport =
+      await env.DB.prepare(`
+        SELECT *
+        FROM sales_imports
+        WHERE id = ?
+          AND user_id = ?
+        LIMIT 1
+      `)
+        .bind(
+          importId,
+          userId
+        )
+        .first();
+
+    if (!salesImport) {
+      return json({
+        success: false,
+        error: "Sales import not found"
+      }, 404);
+    }
+
+    // --------------------------------------------------------
+    // Read request
+    // --------------------------------------------------------
+
+    const body =
+      await request.json();
+
+    const mapping =
+      body.mapping;
+
+    if (
+      !mapping ||
+      typeof mapping !== "object" ||
+      Array.isArray(mapping)
+    ) {
+      return json({
+        success: false,
+        error: "mapping must be an object"
+      }, 400);
+    }
+
+    // --------------------------------------------------------
+    // Required mappings
+    // --------------------------------------------------------
+
+    const requiredFields = [
+      "isrc",
+      "event_date",
+      "channel",
+      "territory",
+      "streams",
+      "gross_revenue",
+      "net_revenue",
+      "currency",
+      "source_record_id"
+    ];
+
+    const missingFields =
+      requiredFields.filter(
+        field => !mapping[field]
+      );
+
+    if (missingFields.length) {
+      return json({
+        success: false,
+        error: "Required mapping fields are missing",
+        missing_fields: missingFields
+      }, 400);
+    }
+
+    // --------------------------------------------------------
+    // Make sure mapped columns are strings
+    // --------------------------------------------------------
+
+    for (const [field, column] of Object.entries(mapping)) {
+      if (
+        typeof column !== "string" ||
+        !column.trim()
+      ) {
+        return json({
+          success: false,
+          error:
+            `Mapping for "${field}" must be a non-empty string`
+        }, 400);
+      }
+    }
+
+    // --------------------------------------------------------
+    // Save mapping
+    // --------------------------------------------------------
+
+    await env.DB.prepare(`
+      UPDATE sales_imports
+      SET
+        column_mapping_json = ?,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+        AND user_id = ?
+    `)
+      .bind(
+        JSON.stringify(mapping),
+        importId,
+        userId
+      )
+      .run();
+
+    const updatedImport =
+      await env.DB.prepare(`
+        SELECT *
+        FROM sales_imports
+        WHERE id = ?
+          AND user_id = ?
+        LIMIT 1
+      `)
+        .bind(
+          importId,
+          userId
+        )
+        .first();
+
+    return json({
+      success: true,
+      message: "CSV column mapping saved successfully",
+      import: updatedImport,
+      mapping
+    });
+
+  } catch (error) {
+
+    console.error(
+      "POST /v1/sales/imports/:id/mapping error:",
+      error
+    );
+
+    return json({
+      success: false,
+      error:
+        error?.message ||
+        "Failed to save CSV column mapping"
+    }, 500);
+  }
+}
+
+// ============================================================
+// POST /v1/sales/imports/:id/process
+// Process uploaded CSV from R2
+// ============================================================
+
+if (
+  request.method === "POST" &&
+  url.pathname.match(
+    /^\/v1\/sales\/imports\/[^/]+\/process$/
+  )
+) {
+  const authResult =
+    await requireSalesAuth(
+      request,
+      env
+    );
+
+  if (!authResult.ok) {
+    return authResult.response;
+  }
+
+  const userId =
+    authResult.userId;
+
+  try {
+
+    const parts =
+      url.pathname.split("/");
+
+    const importId =
+      parts[4];
+
+    if (!importId) {
+      return json({
+        success: false,
+        error: "Import ID is required"
+      }, 400);
+    }
+
+    // --------------------------------------------------------
+    // Load import
+    // --------------------------------------------------------
+
+    const salesImport =
+      await env.DB.prepare(`
+        SELECT *
+        FROM sales_imports
+        WHERE id = ?
+          AND user_id = ?
+        LIMIT 1
+      `)
+        .bind(
+          importId,
+          userId
+        )
+        .first();
+
+    if (!salesImport) {
+      return json({
+        success: false,
+        error: "Sales import not found"
+      }, 404);
+    }
+
+    // --------------------------------------------------------
+    // Check R2 file
+    // --------------------------------------------------------
+
+    if (!salesImport.source_file_key) {
+      return json({
+        success: false,
+        error: "This import does not have an R2 source file"
+      }, 400);
+    }
+
+    // --------------------------------------------------------
+    // Check mapping
+    // --------------------------------------------------------
+
+    if (!salesImport.column_mapping_json) {
+      return json({
+        success: false,
+        error:
+          "CSV column mapping has not been saved"
+      }, 400);
+    }
+
+    let mapping;
+
+    try {
+      mapping =
+        JSON.parse(
+          salesImport.column_mapping_json
+        );
+    } catch {
+      return json({
+        success: false,
+        error:
+          "Saved CSV column mapping is invalid"
+      }, 500);
+    }
+
+    // --------------------------------------------------------
+    // Prevent processing twice
+    // --------------------------------------------------------
+
+    if (
+      salesImport.status === "completed" ||
+      salesImport.status === "completed_with_errors"
+    ) {
+      return json({
+        success: true,
+        duplicate: true,
+        message:
+          "This sales import has already been processed",
+        import: salesImport
+      });
+    }
+
+    // --------------------------------------------------------
+    // Get CSV from R2
+    // --------------------------------------------------------
+
+    const object =
+      await env.MEDIA.get(
+        salesImport.source_file_key
+      );
+
+    if (!object) {
+      return json({
+        success: false,
+        error:
+          "CSV file was not found in R2"
+      }, 404);
+    }
+
+    const csvText =
+      await object.text();
+
+    // --------------------------------------------------------
+    // Parse CSV
+    // --------------------------------------------------------
+
+    const parsed =
+      parseCSV(csvText);
+
+    if (!parsed.headers.length) {
+      return json({
+        success: false,
+        error: "CSV file contains no headers"
+      }, 400);
+    }
+
+    if (!parsed.rows.length) {
+      return json({
+        success: false,
+        error: "CSV file contains no data rows"
+      }, 400);
+    }
+
+    if (
+      parsed.rows.length >
+      SALES_IMPORT_MAX_ROWS
+    ) {
+      return json({
+        success: false,
+        error:
+          `Import cannot contain more than ${SALES_IMPORT_MAX_ROWS} rows`
+      }, 400);
+    }
+
+    // --------------------------------------------------------
+    // Validate mapped columns exist
+    // --------------------------------------------------------
+
+    const missingColumns = [];
+
+    for (
+      const [field, column]
+      of Object.entries(mapping)
+    ) {
+      if (
+        column &&
+        !parsed.headers.includes(
+          String(column).toLowerCase()
+        )
+      ) {
+        missingColumns.push({
+          field,
+          column
+        });
+      }
+    }
+
+    if (missingColumns.length) {
+      return json({
+        success: false,
+        error:
+          "One or more mapped CSV columns do not exist",
+        missing_columns:
+          missingColumns,
+        headers:
+          parsed.headers
+      }, 400);
+    }
+
+    // --------------------------------------------------------
+    // Mark processing
+    // --------------------------------------------------------
+
+    await env.DB.prepare(`
+      UPDATE sales_imports
+      SET
+        status = 'processing',
+        records_received = ?,
+        started_at = CURRENT_TIMESTAMP,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+        AND user_id = ?
+    `)
+      .bind(
+        parsed.rows.length,
+        importId,
+        userId
+      )
+      .run();
+
+    // --------------------------------------------------------
+    // Counters
+    // --------------------------------------------------------
+
+    let imported = 0;
+    let skipped = 0;
+    let failed = 0;
+
+    let totalGross = 0;
+    let totalNet = 0;
+
+    const currencies =
+      new Set();
+
+    let periodStart = null;
+    let periodEnd = null;
+
+    const rowResults = [];
+
+    // --------------------------------------------------------
+    // Process every CSV row
+    // --------------------------------------------------------
+
+    for (
+      let index = 0;
+      index < parsed.rows.length;
+      index++
+    ) {
+
+      const rowNumber =
+        index + 2;
+
+      const rawRow =
+        parsed.rows[index];
+
+      try {
+
+        // ----------------------------------------------------
+        // Map CSV row
+        // ----------------------------------------------------
+
+        const normalized =
+          normalizeMappedCSVRow(
+            rawRow,
+            mapping,
+            rowNumber
+          );
+
+        const data =
+          normalized.data;
+
+        // ----------------------------------------------------
+        // Validate
+        // ----------------------------------------------------
+
+        const validationErrors =
+          validateImportedSalesRow(
+            data
+          );
+
+        if (
+          validationErrors.length
+        ) {
+
+          failed++;
+
+          for (
+            const validationError
+            of validationErrors
+          ) {
+
+            await createSalesImportError(
+              env,
+              {
+                importId,
+                rowNumber,
+                sourceRecordId:
+                  data.source_record_id,
+                errorCode:
+                  validationError.code,
+                errorMessage:
+                  validationError.message,
+                rawData:
+                  rawRow
+              }
+            );
+          }
+
+          rowResults.push({
+            row: rowNumber,
+            status: "failed",
+            errors:
+              validationErrors
+          });
+
+          continue;
+        }
+
+        // ----------------------------------------------------
+        // Match ISRC
+        // ----------------------------------------------------
+
+        const track =
+          await resolveSalesTrack(
+            env,
+            userId,
+            data.isrc
+          );
+
+        if (!track) {
+
+          failed++;
+
+          await createSalesImportError(
+            env,
+            {
+              importId,
+              rowNumber,
+              sourceRecordId:
+                data.source_record_id,
+              errorCode:
+                "ISRC_NOT_FOUND",
+              errorMessage:
+                `No Audiory track found for ISRC ${data.isrc}`,
+              rawData:
+                rawRow
+            }
+          );
+
+          rowResults.push({
+            row: rowNumber,
+            status: "failed",
+            error: {
+              code:
+                "ISRC_NOT_FOUND",
+              message:
+                `No Audiory track found for ISRC ${data.isrc}`
+            }
+          });
+
+          continue;
+        }
+
+        // ----------------------------------------------------
+        // Fill matched catalog information
+        // ----------------------------------------------------
+
+        data.track_id =
+          track.id;
+
+        data.release_id =
+          track.release_id;
+
+        data.artist_id =
+          track.artist_id ||
+          null;
+
+        // resolveSalesTrack currently returns artist_name,
+        // but not artist_id, so load it from the release.
+        if (!data.artist_id) {
+
+          const release =
+            await env.DB.prepare(`
+              SELECT
+                artist_id
+              FROM releases
+              WHERE id = ?
+                AND user_id = ?
+              LIMIT 1
+            `)
+              .bind(
+                track.release_id,
+                userId
+              )
+              .first();
+
+          if (release) {
+            data.artist_id =
+              release.artist_id;
+          }
+        }
+
+        // ----------------------------------------------------
+        // Duplicate check
+        // ----------------------------------------------------
+
+        const existingEvent =
+          await findExistingSalesEvent(
+            env,
+            userId,
+            salesImport.source,
+            data.source_record_id
+          );
+
+        if (existingEvent) {
+
+          skipped++;
+
+          rowResults.push({
+            row: rowNumber,
+            status: "duplicate",
+            source_record_id:
+              data.source_record_id,
+            existing_event_id:
+              existingEvent.id
+          });
+
+          continue;
+        }
+
+        // ----------------------------------------------------
+        // Insert sales event
+        // ----------------------------------------------------
+
+        const eventId =
+          `sale_${crypto.randomUUID()}`;
+
+        await env.DB.prepare(`
+          INSERT INTO sales_events (
+            id,
+            user_id,
+            release_id,
+            track_id,
+            isrc,
+            artist_id,
+            channel,
+            territory,
+            sale_type,
+            event_date,
+            streams,
+            downloads,
+            units,
+            gross_revenue,
+            net_revenue,
+            currency,
+            stream_rate,
+            source,
+            source_record_id,
+            metadata_json
+          )
+          VALUES (
+            ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?,
+            ?, ?
+          )
+        `)
+          .bind(
+            eventId,
+            userId,
+            data.release_id,
+            data.track_id,
+            data.isrc,
+            data.artist_id,
+            data.channel,
+            data.territory,
+            data.sale_type,
+            data.event_date,
+            data.streams,
+            data.downloads,
+            data.units,
+            data.gross_revenue,
+            data.net_revenue,
+            data.currency,
+            data.stream_rate,
+            salesImport.source,
+            data.source_record_id,
+            data.metadata_json
+              ? JSON.stringify(
+                  data.metadata_json
+                )
+              : null
+          )
+          .run();
+
+        // ----------------------------------------------------
+        // Aggregate sales event
+        // ----------------------------------------------------
+
+        const aggregation =
+          await aggregateSalesEvent(
+            env,
+            eventId
+          );
+
+        if (
+          !aggregation ||
+          aggregation.success !== true
+        ) {
+          throw new Error(
+            "Sales event aggregation failed"
+          );
+        }
+
+        imported++;
+
+        totalGross +=
+          data.gross_revenue;
+
+        totalNet +=
+          data.net_revenue;
+
+        currencies.add(
+          data.currency
+        );
+
+        if (
+          !periodStart ||
+          data.event_date < periodStart
+        ) {
+          periodStart =
+            data.event_date;
+        }
+
+        if (
+          !periodEnd ||
+          data.event_date > periodEnd
+        ) {
+          periodEnd =
+            data.event_date;
+        }
+
+        rowResults.push({
+          row: rowNumber,
+          status: "imported",
+          event_id: eventId,
+          isrc: data.isrc,
+          track_id: data.track_id,
+          release_id: data.release_id
+        });
+
+      } catch (error) {
+
+        failed++;
+
+        await createSalesImportError(
+          env,
+          {
+            importId,
+            rowNumber,
+            sourceRecordId:
+              rawRow.source_record_id ||
+              rawRow["record id"] ||
+              null,
+            errorCode:
+              "ROW_IMPORT_FAILED",
+            errorMessage:
+              error?.message ||
+              "Failed to import sales row",
+            rawData:
+              rawRow
+          }
+        );
+
+        rowResults.push({
+          row: rowNumber,
+          status: "failed",
+          errors: [
+            {
+              code:
+                "ROW_IMPORT_FAILED",
+              message:
+                error?.message ||
+                "Failed to import sales row"
+            }
+          ]
+        });
+      }
+    }
+
+    // --------------------------------------------------------
+    // Determine status
+    // --------------------------------------------------------
+
+    let status =
+      "completed";
+
+    if (
+      failed > 0 &&
+      imported > 0
+    ) {
+      status =
+        "completed_with_errors";
+    }
+
+    if (
+      failed > 0 &&
+      imported === 0
+    ) {
+      status =
+        "failed";
+    }
+
+    // --------------------------------------------------------
+    // Update import
+    // --------------------------------------------------------
+
+    await env.DB.prepare(`
+      UPDATE sales_imports
+      SET
+        period_start = ?,
+        period_end = ?,
+        status = ?,
+        records_received = ?,
+        records_imported = ?,
+        records_skipped = ?,
+        total_gross_revenue = ?,
+        total_net_revenue = ?,
+        currency = ?,
+        isrc_match_count = ?,
+        isrc_unmatched_count = ?,
+        completed_at = CURRENT_TIMESTAMP,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+        AND user_id = ?
+    `)
+      .bind(
+        periodStart,
+        periodEnd,
+        status,
+        parsed.rows.length,
+        imported,
+        skipped,
+        totalGross,
+        totalNet,
+        currencies.size === 1
+          ? [...currencies][0]
+          : null,
+        imported,
+        failed,
+        importId,
+        userId
+      )
+      .run();
+
+    // --------------------------------------------------------
+    // Return final import
+    // --------------------------------------------------------
+
+    const finalImport =
+      await env.DB.prepare(`
+        SELECT *
+        FROM sales_imports
+        WHERE id = ?
+          AND user_id = ?
+        LIMIT 1
+      `)
+        .bind(
+          importId,
+          userId
+        )
+        .first();
+
+    return json({
+      success: true,
+      message:
+        "CSV sales import processed successfully",
+      import: finalImport,
+      summary: {
+        records_received:
+          parsed.rows.length,
+        records_imported:
+          imported,
+        records_skipped:
+          skipped,
+        records_failed:
+          failed,
+        total_gross_revenue:
+          Number(
+            totalGross.toFixed(6)
+          ),
+        total_net_revenue:
+          Number(
+            totalNet.toFixed(6)
+          ),
+        currencies:
+          [...currencies]
+      },
+      rows:
+        rowResults
+    });
+
+  } catch (error) {
+
+    console.error(
+      "POST /v1/sales/imports/:id/process error:",
+      error
+    );
+
+    // Mark import as failed
+    try {
+      await env.DB.prepare(`
+        UPDATE sales_imports
+        SET
+          status = 'failed',
+          error_code = 'IMPORT_PROCESS_FAILED',
+          error_message = ?,
+          updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+          AND user_id = ?
+      `)
+        .bind(
+          error?.message ||
+            "Failed to process CSV import",
+          importId,
+          userId
+        )
+        .run();
+    } catch {}
+
+    return json({
+      success: false,
+      error:
+        error?.message ||
+        "Failed to process CSV sales import"
     }, 500);
   }
 }
